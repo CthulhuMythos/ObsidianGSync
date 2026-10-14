@@ -2,6 +2,8 @@ import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type GSyncPlugin from "./main";
 import { DEFAULT_REDIRECT } from "./auth";
 
+const DONATE_URL = "https://www.paypal.com/donate/?hosted_button_id=N8NVQRB353E2G";
+
 export interface GSyncSettings {
   clientId: string;
   clientSecret: string;
@@ -211,6 +213,17 @@ export class GSyncSettingTab extends PluginSettingTab {
           this.plugin.state = {};
           await this.plugin.saveAll();
           new Notice("Sync state reset.");
+        })
+      );
+
+    new Setting(containerEl).setName("Support").setHeading();
+
+    new Setting(containerEl)
+      .setName("Support GSync")
+      .setDesc("GSync is free and open source. If it saves you a subscription, you can chip in to support development.")
+      .addButton((b) =>
+        b.setButtonText("Donate via PayPal").onClick(() => {
+          window.open(DONATE_URL);
         })
       );
   }
