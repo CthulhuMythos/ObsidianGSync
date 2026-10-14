@@ -6,6 +6,8 @@ Works on **Windows, macOS, Linux, Android, and iPad/iPhone**, including mobile d
 
 **Available in Obsidian's Community plugins:** [community.obsidian.md/plugins/gsync](https://community.obsidian.md/plugins/gsync)
 
+**Like GSync?** It's free and open source. You can [support development via PayPal](https://www.paypal.com/donate/?hosted_button_id=N8NVQRB353E2G).
+
 ---
 
 ## Features
@@ -248,6 +250,16 @@ To verify a downloaded `main.js`:
 ```
 gh attestation verify main.js --repo dg0988/ObsidianGSync
 ```
+
+---
+
+## Support
+
+GSync is free, open source, and maintained in my spare time. If it saves you a subscription or a headache, you can support development:
+
+[**Donate via PayPal**](https://www.paypal.com/donate/?hosted_button_id=N8NVQRB353E2G)
+
+Bug reports and feature requests are just as welcome: [open an issue](https://github.com/dg0988/ObsidianGSync/issues).
 
 ---
 
