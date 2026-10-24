@@ -2,6 +2,7 @@ import { Notice, ObsidianProtocolData, Platform, Plugin } from "obsidian";
 import { exchangeCode, isPendingValid, PendingAuth, prepareSignIn, PreparedSignIn, PROTOCOL_ACTION, refreshAccessToken } from "./auth";
 import { DriveClient } from "./drive";
 import { DEFAULT_SETTINGS, GSyncSettings, GSyncSettingTab } from "./settings";
+import { RemoteSnapshot } from "./remote-cache";
 import { MassDeleteError, runSync, SyncState } from "./sync";
 
 interface PluginData {
@@ -42,6 +43,11 @@ export default class GSyncPlugin extends Plugin {
 
     this.addRibbonIcon("refresh-cw", "Sync with Google Drive", () => void this.sync(false));
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.sync(false) });
+    this.addCommand({
+      id: "sync-full-rescan",
+      name: "Sync now (full rescan)",
+      callback: () => void this.sync(false, false, true),
+    });
     this.addCommand({
       id: "sync-allow-deletions",
       name: "Sync now, allowing deletions",
@@ -162,7 +168,22 @@ export default class GSyncPlugin extends Plugin {
     this.statusEl.setText(text);
   }
 
-  async sync(quiet: boolean, allowMassDelete = false) {
+  /** The remote tree from the last successful sync, kept next to data.json (not synced: hidden folder). */
+  private get cachePath() {
+    return `${this.manifest.dir}/remote-cache.json`;
+  }
+
+  private async loadSnapshot(): Promise<RemoteSnapshot | null> {
+    try {
+      if (!(await this.app.vault.adapter.exists(this.cachePath))) return null;
+      return JSON.parse(await this.app.vault.adapter.read(this.cachePath)) as RemoteSnapshot;
+    } catch (e) {
+      console.warn("[gsync] ignoring unreadable remote cache", e);
+      return null;
+    }
+  }
+
+  async sync(quiet: boolean, allowMassDelete = false, fullScan = false) {
     if (this.syncing) {
       if (!quiet) new Notice("Sync already running.");
       return;
@@ -199,7 +220,9 @@ export default class GSyncPlugin extends Plugin {
             else progressNotice.setMessage(msg);
           }
         },
-      }, { allowMassDelete });
+      }, { allowMassDelete, fullScan, snapshot: await this.loadSnapshot() });
+      if (r.snapshot) await this.app.vault.adapter.write(this.cachePath, JSON.stringify(r.snapshot));
+      console.debug(`[gsync] read Drive ${r.listing === "incremental" ? "incrementally" : "fully"}${r.rescanReason ? ` (${r.rescanReason})` : ""}`);
       this.syncInProgress = false;
       await this.saveAll();
       const parts: string[] = [];

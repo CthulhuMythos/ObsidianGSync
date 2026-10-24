@@ -13,6 +13,14 @@ export interface RemoteFile {
   modifiedTime: string;
   size?: string;
   trashed?: boolean;
+  parents?: string[];
+}
+
+/** One entry of the Drive changes feed. */
+export interface DriveChange {
+  fileId: string;
+  removed?: boolean;
+  file?: RemoteFile;
 }
 
 export interface RemoteTree {
@@ -28,6 +36,12 @@ export interface ListTreeOptions {
   skipFolder?: (path: string) => boolean;
   /** Folders listed so far / folders known so far. */
   onProgress?: (done: number, total: number) => void;
+}
+
+interface ChangeList {
+  changes: DriveChange[];
+  nextPageToken?: string;
+  newStartPageToken?: string;
 }
 
 interface FileList {
@@ -127,9 +141,36 @@ export class DriveClient {
     return { id: parent, created };
   }
 
+  /** Token marking "now" in the changes feed; take it before a full listing. */
+  async getStartPageToken(): Promise<string> {
+    const r = await this.req(`${API}/changes/startPageToken`);
+    return (r.json as { startPageToken: string }).startPageToken;
+  }
+
+  /** Every change since `token`, and the token to use next time. */
+  async listChanges(token: string): Promise<{ changes: DriveChange[]; newToken: string }> {
+    const changes: DriveChange[] = [];
+    let page = token;
+    for (;;) {
+      const params = new URLSearchParams({
+        pageToken: page,
+        pageSize: "1000",
+        spaces: "drive",
+        includeRemoved: "true",
+        fields: `nextPageToken,newStartPageToken,changes(fileId,removed,file(${FIELDS},trashed,parents))`,
+      });
+      const r = await this.req(`${API}/changes?${params.toString()}`);
+      const body = r.json as ChangeList;
+      changes.push(...body.changes);
+      if (body.nextPageToken) page = body.nextPageToken;
+      else if (body.newStartPageToken) return { changes, newToken: body.newStartPageToken };
+      else throw new Error("Drive changes feed returned no next token.");
+    }
+  }
+
   /** Current metadata of one file or folder, including whether it is in the trash. */
   async getFile(id: string): Promise<RemoteFile> {
-    const r = await this.req(`${API}/files/${encodeURIComponent(id)}?fields=${FIELDS},trashed`);
+    const r = await this.req(`${API}/files/${encodeURIComponent(id)}?fields=${FIELDS},trashed,parents`);
     return r.json as RemoteFile;
   }
 

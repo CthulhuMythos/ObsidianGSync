@@ -1,5 +1,6 @@
 import { App, TFile } from "obsidian";
 import { DriveClient, FOLDER_MIME, RemoteFile, RemoteTree } from "./drive";
+import { applyChanges, RemoteSnapshot, toSnapshot } from "./remote-cache";
 import { GSyncSettings } from "./settings";
 
 /** What both sides looked like the last time this path was in sync. */
@@ -26,6 +27,12 @@ export interface SyncResult {
   deferred: string[];
   /** Missing from Drive but kept here until the deletion has been confirmed by a later sync. */
   pendingDeletes: string[];
+  /** How the Drive tree was read this time. */
+  listing: "full" | "incremental";
+  /** Why an incremental read fell back to a full listing, if it did. */
+  rescanReason?: string;
+  /** Remote tree to start the next sync from (save it only if the sync succeeded). */
+  snapshot?: RemoteSnapshot;
 }
 
 export interface SyncOptions {
@@ -33,6 +40,10 @@ export interface SyncOptions {
   allowMassDelete?: boolean;
   /** Current time in ms; tests pass a fake clock. */
   now?: number;
+  /** Remote tree saved by the previous successful sync. */
+  snapshot?: RemoteSnapshot | null;
+  /** List every Drive folder even if the snapshot could be used. */
+  fullScan?: boolean;
 }
 
 /** Thrown before anything is deleted when a sync would delete more than the safety limit. */
@@ -128,18 +139,53 @@ export async function runSync(
   opts: SyncOptions = {}
 ): Promise<SyncResult> {
   const vault = app.vault;
-  const res: SyncResult = { uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: [], errors: [], warnings: [], skipped: [], deferred: [], pendingDeletes: [] };
+  const res: SyncResult = { uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: [], errors: [], warnings: [], skipped: [], deferred: [], pendingDeletes: [], listing: "full" };
   const maxBytes = Math.max(0, settings.maxFileSizeMB) * 1024 * 1024;
   const rules = parseExcludes(settings.excludes);
   const configDir = vault.configDir;
 
+  const now = opts.now ?? Date.now();
   const rootId = await resolveRoot(drive, settings, state);
-  const tree: RemoteTree = await drive.listTree(rootId, {
-    // A folder whose contents are all excluded (hidden, config dir, "Folder/" rules) is never listed.
-    skipFolder: (p) => isExcluded(p + "/", rules, configDir),
-    onProgress: hooks.listing,
-  });
+  // A folder whose contents are all excluded (hidden, config dir, "Folder/" rules) is never listed.
+  const skipFolder = (p: string) => isExcluded(p + "/", rules, configDir);
+  const skipKey = JSON.stringify([configDir, rules]);
+
+  // Read only what changed since the last sync when possible; list everything otherwise.
+  let tree: RemoteTree | null = null;
+  let token = "";
+  let fullAt = now;
+  const snap = opts.snapshot;
+  const fullEveryMs = Math.max(0, settings.fullRescanHours) * 60 * 60 * 1000;
+  if (
+    !opts.fullScan &&
+    snap?.version === 1 &&
+    snap.rootId === rootId &&
+    snap.skipKey === skipKey &&
+    fullEveryMs > 0 &&
+    snap.fullAt > 0 && // 0 = a previous sync asked for a full listing
+    now - snap.fullAt < fullEveryMs
+  ) {
+    try {
+      const { changes, newToken } = await drive.listChanges(snap.token);
+      const out = applyChanges(snap, changes, skipFolder);
+      if ("tree" in out) {
+        tree = out.tree;
+        token = newToken;
+        fullAt = snap.fullAt;
+        res.listing = "incremental";
+      } else res.rescanReason = out.rescan;
+    } catch (e) {
+      res.rescanReason = `changes feed failed: ${(e as Error).message}`;
+    }
+  }
+  if (!tree) {
+    token = await drive.getStartPageToken(); // before listing, so changes made meanwhile are read next time
+    tree = await drive.listTree(rootId, { skipFolder, onProgress: hooks.listing });
+  }
   res.warnings.push(...tree.warnings);
+  // Taken before this sync writes anything: the next read replays our own changes from the feed.
+  res.snapshot = toSnapshot(tree, rootId, token, fullAt, skipKey);
+  const remoteTree: RemoteTree = tree;
 
   const local = new Map<string, TFile>();
   for (const f of vault.getFiles()) if (!isExcluded(f.path, rules, configDir)) local.set(f.path, f);
@@ -148,7 +194,6 @@ export async function runSync(
   // Drive can briefly hide files, e.g. while a folder is being restored from the
   // trash. A file missing from Drive must stay missing across syncs for this long
   // before the local copy is trashed.
-  const now = opts.now ?? Date.now();
   const confirmMs = Math.max(0, settings.confirmDriveDeletesMinutes) * 60 * 1000;
   const driveDeleteConfirmed = (s: SyncRecord) => confirmMs === 0 || (s.missingSince !== undefined && now - s.missingSince >= confirmMs);
 
@@ -181,16 +226,16 @@ export async function runSync(
   const ensureRemoteParent = async (path: string): Promise<string> => {
     const parts = path.split("/").slice(0, -1);
     let cur = "";
-    let parentId = tree.folders.get("") as string;
+    let parentId = remoteTree.folders.get("") as string;
     for (const p of parts) {
       cur = cur ? `${cur}/${p}` : p;
-      let id = tree.folders.get(cur);
+      let id = remoteTree.folders.get(cur);
       if (!id) {
         const key = cur;
         let pending = creatingRemote.get(key);
         if (!pending) {
           pending = drive.createFolder(p, parentId).then((newId) => {
-            tree.folders.set(key, newId);
+            remoteTree.folders.set(key, newId);
             return newId;
           });
           creatingRemote.set(key, pending);
@@ -236,6 +281,31 @@ export async function runSync(
     const cur = await drive.getFile(r.id);
     if (!cur.trashed && rev(cur) === rev(r)) return true;
     res.deferred.push(path);
+    return false;
+  };
+
+  /**
+   * Before trashing a local file because the listing doesn't show it, ask Drive
+   * about the file itself. If it is still at this path in the synced folder the
+   * listing was wrong (a missed change, a half-finished restore): keep the local
+   * copy and do a full listing next time.
+   */
+  const stillGoneFromDrive = async (path: string, s: SyncRecord): Promise<boolean> => {
+    let f: RemoteFile;
+    try {
+      f = await drive.getFile(s.remoteId);
+    } catch (e) {
+      if (/Drive API 404/.test((e as Error).message)) return true;
+      throw e;
+    }
+    if (f.trashed) return true;
+    const folderPathById = new Map<string, string>();
+    for (const [p, id] of remoteTree.folders) folderPathById.set(id, p);
+    const parent = folderPathById.get(f.parents?.[0] ?? "");
+    const current = parent === undefined ? undefined : parent ? `${parent}/${f.name}` : f.name;
+    if (current !== path) return true; // moved or renamed away from this path, or out of the synced folder
+    res.deferred.push(path);
+    if (res.snapshot) res.snapshot.fullAt = 0;
     return false;
   };
 
@@ -302,6 +372,7 @@ export async function runSync(
             res.pendingDeletes.push(path);
             return;
           }
+          if (!(await stillGoneFromDrive(path, s))) return;
           await app.fileManager.trashFile(l); // deleted in Drive (confirmed) -> delete here
           delete state[path];
           res.deletedLocal++;

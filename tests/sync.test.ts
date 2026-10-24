@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { TFile, TFolder } from "obsidian";
-import { DriveClient, ListTreeOptions, RemoteFile, RemoteTree } from "../src/drive";
+import { DriveChange, DriveClient, ListTreeOptions, RemoteFile, RemoteTree } from "../src/drive";
+import { applyChanges, RemoteSnapshot, toSnapshot } from "../src/remote-cache";
 import { DEFAULT_SETTINGS, GSyncSettings, parseFolderId } from "../src/settings";
 import { MassDeleteError, runSync, SyncOptions, SyncState } from "../src/sync";
 
@@ -164,9 +165,47 @@ class FakeDrive {
   async getFile(id: string) {
     const n = this.nodes.get(id);
     if (!n) throw new Error(`Drive API 404: ${id}`);
-    return { ...this.meta(n), trashed: this.isTrashed(id) };
+    return { ...this.meta(n), trashed: this.isTrashed(id), parents: [n.parent] };
+  }
+
+  // Changes feed: a token remembers every node's state; listChanges reports what differs.
+  private tokens = new Map<string, Map<string, string>>();
+  private nTok = 0;
+  listTreeCalls = 0;
+  private capture() {
+    const m = new Map<string, string>();
+    for (const n of this.nodes.values()) m.set(n.id, JSON.stringify([n.name, n.parent, this.isTrashed(n.id), n.data ? md5(n.data) : "", n.modifiedTime]));
+    return m;
+  }
+  /** Forget a change, as if the feed had missed it. */
+  dropFromFeed(id: string) {
+    for (const m of this.tokens.values()) m.set(id, this.capture().get(id) as string);
+  }
+  async getStartPageToken() {
+    const t = `tok${++this.nTok}`;
+    this.tokens.set(t, this.capture());
+    return t;
+  }
+  async listChanges(token: string): Promise<{ changes: DriveChange[]; newToken: string }> {
+    const before = this.tokens.get(token);
+    if (!before) throw new Error("Drive API 400: invalid page token");
+    const now = this.capture();
+    const changes: DriveChange[] = [];
+    for (const [id, sig] of now) {
+      if (before.get(id) === sig) continue;
+      const n = this.nodes.get(id) as Node;
+      changes.push({ fileId: id, file: { ...this.meta(n), trashed: this.isTrashed(id), parents: [n.parent] } });
+    }
+    for (const id of before.keys()) if (!now.has(id)) changes.push({ fileId: id, removed: true });
+    const newToken = `tok${++this.nTok}`;
+    this.tokens.set(newToken, now);
+    const hook = this.afterList;
+    this.afterList = null;
+    hook?.();
+    return { changes, newToken };
   }
   async listTree(rootId: string, opts: ListTreeOptions = {}): Promise<RemoteTree> {
+    this.listTreeCalls++;
     const files = new Map<string, RemoteFile>();
     const folders = new Map<string, string>([["", rootId]]);
     const walk = (id: string, prefix: string) => {
@@ -216,9 +255,14 @@ function setup(over: Partial<GSyncSettings> = {}) {
   const settings: GSyncSettings = { ...DEFAULT_SETTINGS, remoteFolder: "Obsidian/Test", ...over };
   const clock = { now: 1_000_000 };
   const minutes = (m: number) => (clock.now += m * 60 * 1000);
-  const sync = (opts: SyncOptions = {}) =>
-    runSync(vault.app() as never, drive as unknown as DriveClient, settings, state, { checkpoint: async () => {}, progress: () => {} }, { now: clock.now, ...opts });
-  return { vault, drive, state, settings, sync, minutes };
+  // Like main.ts: keep the remote snapshot of the last successful sync.
+  const cache: { snapshot: RemoteSnapshot | null } = { snapshot: null };
+  const sync = async (opts: SyncOptions = {}) => {
+    const r = await runSync(vault.app() as never, drive as unknown as DriveClient, settings, state, { checkpoint: async () => {}, progress: () => {} }, { now: clock.now, snapshot: cache.snapshot, ...opts });
+    if (r.snapshot) cache.snapshot = r.snapshot;
+    return r;
+  };
+  return { vault, drive, state, settings, sync, minutes, cache };
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -508,3 +552,162 @@ test("concurrent transfers: many new files in one new folder create it once, bot
   assert.equal(t.vault.read("down/a/b/g11.md"), "G11");
 });
 
+
+// ---- incremental reads (changes feed) ---------------------------------------
+const F = (id: string, name: string, parent: string, extra: Partial<RemoteFile> = {}): RemoteFile => ({
+  id, name, mimeType: "text/markdown", modifiedTime: "t", md5Checksum: id, parents: [parent], ...extra,
+});
+const DIR = (id: string, name: string, parent: string, extra: Partial<RemoteFile> = {}) => F(id, name, parent, { mimeType: FOLDER, ...extra });
+const hiddenSkip = (p: string) => p.split("/").some((s) => s.startsWith("."));
+function baseSnap(): RemoteSnapshot {
+  const tree: RemoteTree = {
+    files: new Map([["a.md", F("fa", "a.md", "R")], ["notes/b.md", F("fb", "b.md", "N")]]),
+    folders: new Map([["", "R"], ["notes", "N"]]),
+    warnings: [],
+  };
+  return toSnapshot(tree, "R", "tok", 0, "k");
+}
+const applyOk = (snap: RemoteSnapshot, changes: DriveChange[]) => {
+  const out = applyChanges(snap, changes, hiddenSkip);
+  assert.ok("tree" in out, JSON.stringify(out));
+  return (out as { tree: RemoteTree }).tree;
+};
+
+test("applyChanges: file edits, creates, trash, removal, moves", () => {
+  const t = applyOk(baseSnap(), [
+    { fileId: "fa", file: F("fa", "a.md", "R", { md5Checksum: "new" }) },
+    { fileId: "fc", file: F("fc", "c.md", "N") },
+    { fileId: "fb", file: F("fb", "b.md", "N", { trashed: true }) },
+  ]);
+  assert.equal(t.files.get("a.md")?.md5Checksum, "new");
+  assert.equal(t.files.get("notes/c.md")?.id, "fc");
+  assert.ok(!t.files.has("notes/b.md"));
+
+  const moved = applyOk(baseSnap(), [
+    { fileId: "fa", file: F("fa", "renamed.md", "N") },
+    { fileId: "fb", file: F("fb", "b.md", "SOMEWHERE_ELSE") },
+  ]);
+  assert.ok(!moved.files.has("a.md"));
+  assert.equal(moved.files.get("notes/renamed.md")?.id, "fa");
+  assert.ok(!moved.files.has("notes/b.md"), "moved out of the synced folder");
+
+  const removed = applyOk(baseSnap(), [{ fileId: "fa", removed: true }]);
+  assert.ok(!removed.files.has("a.md"));
+});
+
+test("applyChanges: ignores Google Docs, hidden folders and unrelated files", () => {
+  const t = applyOk(baseSnap(), [
+    { fileId: "gd", file: F("gd", "doc", "R", { mimeType: "application/vnd.google-apps.document" }) },
+    { fileId: "hid", file: DIR("hid", ".obsidian", "R") },
+    { fileId: "x", file: F("x", "other.md", "UNRELATED") },
+    { fileId: "N", file: DIR("N", "notes", "R", { modifiedTime: "later" }) }, // metadata only
+    { fileId: "R", file: DIR("R", "MyWiki renamed", "PARENT") }, // the root itself
+  ]);
+  assert.equal(t.files.size, 2);
+});
+
+test("applyChanges: folder structure changes and name clashes ask for a full listing", () => {
+  const cases: [string, DriveChange][] = [
+    ["renamed", { fileId: "N", file: DIR("N", "notes2", "R") }],
+    ["moved", { fileId: "N", file: DIR("N", "notes", "ELSEWHERE") }],
+    ["trashed", { fileId: "N", file: DIR("N", "notes", "R", { trashed: true }) }],
+    ["removed", { fileId: "N", removed: true }],
+    ["new folder", { fileId: "D", file: DIR("D", "new", "R") }],
+    ["root trashed", { fileId: "R", file: DIR("R", "MyWiki", "P", { trashed: true }) }],
+    ["clash", { fileId: "fz", file: F("fz", "a.md", "R") }],
+  ];
+  for (const [label, c] of cases) assert.ok("rescan" in applyChanges(baseSnap(), [c], hiddenSkip), label);
+});
+
+test("incremental: later syncs read the changes feed instead of every folder", async () => {
+  const t = setup();
+  const id = t.drive.mkdirp("Obsidian/Test");
+  const fid = t.drive.putFile(id, "sub/a.md", "v1");
+  const r1 = await t.sync();
+  assert.equal(r1.listing, "full");
+  assert.equal(t.drive.listTreeCalls, 1);
+
+  await t.drive.updateFile(fid, buf("v2"));
+  t.drive.putFile(id, "sub/b.md", "B");
+  const r2 = await t.sync();
+  assert.equal(r2.listing, "incremental");
+  assert.equal(t.drive.listTreeCalls, 1);
+  assert.equal(t.vault.read("sub/a.md"), "v2");
+  assert.equal(t.vault.read("sub/b.md"), "B");
+
+  // Our own upload comes back through the feed and is not downloaded again.
+  t.vault.put("sub/c.md", "C");
+  assert.equal((await t.sync()).uploaded, 1);
+  const r4 = await t.sync();
+  assert.equal(r4.listing, "incremental");
+  assert.equal(r4.downloaded + r4.uploaded, 0);
+});
+
+test("incremental: full rescans on schedule, on demand, when disabled, on rule changes and on feed errors", async () => {
+  const t = setup({ fullRescanHours: 24 });
+  t.drive.mkdirp("Obsidian/Test");
+  await t.sync();
+  assert.equal((await t.sync()).listing, "incremental");
+  assert.equal((await t.sync({ fullScan: true })).listing, "full");
+  t.minutes(25 * 60);
+  assert.equal((await t.sync()).listing, "full");
+  assert.equal((await t.sync()).listing, "incremental");
+
+  t.settings.excludes += "\nTemplates/\n";
+  assert.equal((await t.sync()).listing, "full");
+
+  t.cache.snapshot!.token = "bogus";
+  const r = await t.sync();
+  assert.equal(r.listing, "full");
+  assert.match(r.rescanReason ?? "", /changes feed failed/);
+
+  t.settings.fullRescanHours = 0;
+  assert.equal((await t.sync()).listing, "full");
+});
+
+test("incremental: a renamed folder triggers a full listing and moves notes locally", async () => {
+  const t = setup({ confirmDriveDeletesMinutes: 0 });
+  const id = t.drive.mkdirp("Obsidian/Test");
+  const sub = t.drive.mkdirp("old", id);
+  t.drive.putFile(sub, "n.md", "N");
+  await t.sync();
+
+  t.drive.nodes.get(sub)!.name = "new";
+  const r = await t.sync();
+  assert.equal(r.listing, "full");
+  assert.match(r.rescanReason ?? "", /renamed or moved/);
+  assert.equal(t.vault.read("new/n.md"), "N");
+  assert.equal(t.vault.read("old/n.md"), undefined);
+});
+
+test("incremental: a renamed file is moved locally, not duplicated", async () => {
+  const t = setup({ confirmDriveDeletesMinutes: 0 });
+  const id = t.drive.mkdirp("Obsidian/Test");
+  const fid = t.drive.putFile(id, "a.md", "A");
+  await t.sync();
+  t.drive.nodes.get(fid)!.name = "b.md";
+  const r = await t.sync();
+  assert.equal(r.listing, "incremental");
+  assert.equal(t.vault.read("b.md"), "A");
+  assert.equal(t.vault.read("a.md"), undefined);
+});
+
+test("pre-delete check: a file the listing missed is kept and the next sync lists everything", async () => {
+  const t = setup({ confirmDriveDeletesMinutes: 0 });
+  const id = t.drive.mkdirp("Obsidian/Test");
+  t.drive.putFile(id, "a.md", "A");
+  await t.sync();
+
+  delete t.cache.snapshot!.files["a.md"]; // as if a change had been missed
+  const r = await t.sync();
+  assert.equal(r.listing, "incremental");
+  assert.deepEqual(r.deferred, ["a.md"]);
+  assert.equal(r.deletedLocal, 0);
+  assert.equal(t.vault.read("a.md"), "A");
+  assert.equal(t.cache.snapshot!.fullAt, 0);
+
+  const r2 = await t.sync();
+  assert.equal(r2.listing, "full");
+  assert.equal(r2.deletedLocal, 0);
+  assert.equal(t.vault.read("a.md"), "A");
+});
