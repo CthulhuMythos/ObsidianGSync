@@ -12,6 +12,7 @@ export interface RemoteFile {
   md5Checksum?: string;
   modifiedTime: string;
   size?: string;
+  trashed?: boolean;
 }
 
 export interface RemoteTree {
@@ -93,9 +94,13 @@ export class DriveClient {
     return (r.json as RemoteFile).id;
   }
 
-  /** Resolve a path like "Obsidian/My Vault" under My Drive, creating missing folders. */
-  async ensureFolderPath(path: string): Promise<string> {
+  /**
+   * Resolve a path like "Obsidian/My Vault" under My Drive, creating missing folders.
+   * `created` tells the caller the folder did not exist before this call.
+   */
+  async ensureFolderPath(path: string): Promise<{ id: string; created: boolean }> {
     let parent = "root";
+    let created = false;
     for (const name of path.split(/[/\\]/).map((s) => s.trim()).filter(Boolean)) {
       const params = new URLSearchParams({
         q: `'${q(parent)}' in parents and name = '${q(name)}' and mimeType = '${FOLDER_MIME}' and trashed = false`,
@@ -104,9 +109,19 @@ export class DriveClient {
       });
       const r = await this.req(`${API}/files?${params.toString()}`);
       const found = (r.json as FileList).files;
-      parent = found.length ? found[0].id : await this.createFolder(name, parent);
+      if (found.length) parent = found[0].id;
+      else {
+        parent = await this.createFolder(name, parent);
+        created = true;
+      }
     }
-    return parent;
+    return { id: parent, created };
+  }
+
+  /** Current metadata of one file or folder, including whether it is in the trash. */
+  async getFile(id: string): Promise<RemoteFile> {
+    const r = await this.req(`${API}/files/${encodeURIComponent(id)}?fields=${FIELDS},trashed`);
+    return r.json as RemoteFile;
   }
 
   async listTree(rootId: string): Promise<RemoteTree> {

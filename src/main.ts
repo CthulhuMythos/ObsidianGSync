@@ -2,7 +2,7 @@ import { Notice, ObsidianProtocolData, Platform, Plugin } from "obsidian";
 import { exchangeCode, isPendingValid, PendingAuth, prepareSignIn, PreparedSignIn, PROTOCOL_ACTION, refreshAccessToken } from "./auth";
 import { DriveClient } from "./drive";
 import { DEFAULT_SETTINGS, GSyncSettings, GSyncSettingTab } from "./settings";
-import { runSync, SyncState } from "./sync";
+import { MassDeleteError, runSync, SyncState } from "./sync";
 
 interface PluginData {
   settings?: Partial<GSyncSettings>;
@@ -42,6 +42,11 @@ export default class GSyncPlugin extends Plugin {
 
     this.addRibbonIcon("refresh-cw", "Sync with Google Drive", () => void this.sync(false));
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.sync(false) });
+    this.addCommand({
+      id: "sync-allow-deletions",
+      name: "Sync now, allowing deletions",
+      callback: () => void this.sync(false, true),
+    });
 
     // Google -> callback.html -> obsidian://gsync-auth?code=...&state=...
     this.registerObsidianProtocolHandler(PROTOCOL_ACTION, (params) => {
@@ -157,7 +162,7 @@ export default class GSyncPlugin extends Plugin {
     this.statusEl.setText(text);
   }
 
-  async sync(quiet: boolean) {
+  async sync(quiet: boolean, allowMassDelete = false) {
     if (this.syncing) {
       if (!quiet) new Notice("Sync already running.");
       return;
@@ -185,7 +190,7 @@ export default class GSyncPlugin extends Plugin {
             else progressNotice.setMessage(msg);
           }
         },
-      });
+      }, { allowMassDelete });
       this.syncInProgress = false;
       await this.saveAll();
       const parts: string[] = [];
@@ -204,6 +209,9 @@ export default class GSyncPlugin extends Plugin {
         console.error("[gsync] errors", r.errors);
         new Notice(`${r.errors.length} file(s) failed to sync. First: ${r.errors[0]}`, 15000);
       }
+      if (r.deferred.length) {
+        new Notice(`Changed in Drive during this sync, left for the next one:\n${r.deferred.slice(0, 5).join("\n")}`, 15000);
+      }
       if (r.skipped.length) {
         new Notice(`Skipped ${r.skipped.length} file(s) over ${s.maxFileSizeMB} MB:\n${r.skipped.slice(0, 5).join("\n")}`, 15000);
       }
@@ -211,7 +219,11 @@ export default class GSyncPlugin extends Plugin {
     } catch (e) {
       this.setStatus("GSync: error");
       console.error("[gsync]", e);
-      new Notice(`GSync failed: ${(e as Error).message}`, 15000);
+      if (e instanceof MassDeleteError) {
+        new Notice(`GSync paused: ${e.message} If you meant to delete these, run "Sync now, allowing deletions" from the command palette.`, 0);
+      } else {
+        new Notice(`GSync failed: ${(e as Error).message}`, 15000);
+      }
     } finally {
       (progressNotice as Notice | null)?.hide();
       if (this.syncInProgress) {

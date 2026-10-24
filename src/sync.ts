@@ -1,5 +1,5 @@
 import { App, TFile } from "obsidian";
-import { DriveClient, RemoteFile, RemoteTree } from "./drive";
+import { DriveClient, FOLDER_MIME, RemoteFile, RemoteTree } from "./drive";
 import { GSyncSettings } from "./settings";
 
 /** What both sides looked like the last time this path was in sync. */
@@ -20,6 +20,20 @@ export interface SyncResult {
   errors: string[];
   warnings: string[];
   skipped: string[];
+  /** Changed in Drive while this sync ran; left untouched for the next sync. */
+  deferred: string[];
+}
+
+export interface SyncOptions {
+  /** Skip the deletion safety limit for this one run (the user confirmed). */
+  allowMassDelete?: boolean;
+}
+
+/** Thrown before anything is deleted when a sync would delete more than the safety limit. */
+export class MassDeleteError extends Error {
+  constructor(public count: number, public limit: number) {
+    super(`This sync would delete ${count} files (safety limit ${limit}). Nothing was deleted.`);
+  }
 }
 
 export interface SyncHooks {
@@ -29,6 +43,29 @@ export interface SyncHooks {
 }
 
 const rev = (f: RemoteFile) => f.md5Checksum ?? f.modifiedTime;
+
+const localChangedSince = (f: TFile, s: SyncRecord) => f.stat.mtime !== s.localMtime || f.stat.size !== s.localSize;
+
+/**
+ * Find the Drive folder to sync with. Refuses to continue when the folder is
+ * gone, because an empty remote would otherwise look like "everything was
+ * deleted in Drive" and move every synced local note to the trash.
+ */
+async function resolveRoot(drive: DriveClient, settings: GSyncSettings, state: SyncState): Promise<string> {
+  if (settings.remoteFolderId) {
+    const f = await drive.getFile(settings.remoteFolderId);
+    if (f.mimeType !== FOLDER_MIME) throw new Error(`Drive ID ${settings.remoteFolderId} is not a folder.`);
+    if (f.trashed) throw new Error(`The Drive folder "${f.name}" is in the trash. Sync stopped so local notes are not deleted.`);
+    return f.id;
+  }
+  const { id, created } = await drive.ensureFolderPath(settings.remoteFolder);
+  if (created && Object.keys(state).length > 0) {
+    throw new Error(
+      `No Drive folder at "${settings.remoteFolder}" any more (renamed, moved or trashed?). Sync stopped so local notes are not deleted. Fix the folder setting, or reset sync state to start over.`
+    );
+  }
+  return id;
+}
 
 function parseExcludes(raw: string): string[] {
   return raw
@@ -76,21 +113,39 @@ export async function runSync(
   drive: DriveClient,
   settings: GSyncSettings,
   state: SyncState,
-  hooks: SyncHooks
+  hooks: SyncHooks,
+  opts: SyncOptions = {}
 ): Promise<SyncResult> {
   const vault = app.vault;
-  const res: SyncResult = { uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: [], errors: [], warnings: [], skipped: [] };
+  const res: SyncResult = { uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: [], errors: [], warnings: [], skipped: [], deferred: [] };
   const maxBytes = Math.max(0, settings.maxFileSizeMB) * 1024 * 1024;
   const rules = parseExcludes(settings.excludes);
   const configDir = vault.configDir;
 
-  const rootId = await drive.ensureFolderPath(settings.remoteFolder);
+  const rootId = await resolveRoot(drive, settings, state);
   const tree: RemoteTree = await drive.listTree(rootId);
   res.warnings.push(...tree.warnings);
 
   const local = new Map<string, TFile>();
   for (const f of vault.getFiles()) if (!isExcluded(f.path, rules, configDir)) local.set(f.path, f);
   const remote = tree.files;
+
+  const tooBig = (l: TFile | undefined, r: RemoteFile | undefined) =>
+    maxBytes > 0 && ((!!l && l.stat.size > maxBytes) || (!!r && Number(r.size ?? 0) > maxBytes));
+
+  // ---- deletion safety limit: count before touching anything ---------------
+  if (settings.propagateDeletes && settings.maxDeletesPerSync > 0 && !opts.allowMassDelete) {
+    let planned = 0;
+    for (const [path, s] of Object.entries(state)) {
+      if (isExcluded(path, rules, configDir)) continue;
+      const l = local.get(path);
+      const r = remote.get(path);
+      if (tooBig(l, r)) continue;
+      if (l && !r && !localChangedSince(l, s)) planned++;
+      else if (!l && r && rev(r) === s.remoteRev) planned++;
+    }
+    if (planned > settings.maxDeletesPerSync) throw new MassDeleteError(planned, settings.maxDeletesPerSync);
+  }
 
   // ---- helpers ------------------------------------------------------------
   const record = async (path: string, r: RemoteFile) => {
@@ -139,7 +194,13 @@ export async function runSync(
     return drive.createFile(name, parentId, data);
   };
 
-  const localChangedSince = (f: TFile, s: SyncRecord) => f.stat.mtime !== s.localMtime || f.stat.size !== s.localSize;
+  /** Re-read a Drive file right before overwriting or trashing it, so a change made meanwhile (another device, an agent) is not lost. */
+  const unchangedInDrive = async (path: string, r: RemoteFile): Promise<boolean> => {
+    const cur = await drive.getFile(r.id);
+    if (!cur.trashed && rev(cur) === rev(r)) return true;
+    res.deferred.push(path);
+    return false;
+  };
 
   const resolveBothChanged = async (path: string, l: TFile, r: RemoteFile) => {
     const [ld, rd] = await Promise.all([vault.readBinary(l), drive.download(r.id)]);
@@ -152,6 +213,7 @@ export async function runSync(
     await writeLocal(cPath, rd);
     const cRemote = await uploadNew(cPath, rd);
     await record(cPath, cRemote);
+    if (!(await unchangedInDrive(path, r))) return;
     const updated = await drive.updateFile(r.id, ld);
     await record(path, updated);
     res.conflicts.push(path);
@@ -178,7 +240,7 @@ export async function runSync(
     try {
       const l = local.get(path);
       const r = remote.get(path);
-      if (maxBytes > 0 && ((l && l.stat.size > maxBytes) || (r && Number(r.size ?? 0) > maxBytes))) {
+      if (tooBig(l, r)) {
         res.skipped.push(path);
         continue;
       }
@@ -193,6 +255,7 @@ export async function runSync(
         const rChanged = rev(r) !== s.remoteRev || r.id !== s.remoteId;
         if (lChanged && rChanged) await resolveBothChanged(path, l, r);
         else if (lChanged) {
+          if (!(await unchangedInDrive(path, r))) continue;
           const updated = await drive.updateFile(r.id, await vault.readBinary(l));
           await record(path, updated);
           res.uploaded++;
@@ -213,6 +276,7 @@ export async function runSync(
         }
       } else if (!l && r) {
         if (s && settings.propagateDeletes && rev(r) === s.remoteRev) {
+          if (!(await unchangedInDrive(path, r))) continue;
           await drive.trash(r.id); // deleted here -> move to Drive trash
           delete state[path];
           res.deletedRemote++;
