@@ -1,4 +1,15 @@
-# GSync
+# GSync (folder ID fork)
+
+> **This is a fork of [dg0988/ObsidianGSync](https://github.com/dg0988/ObsidianGSync)** (MIT). Differences:
+>
+> - **Folder ID**: set "Google Drive folder ID" (or paste the folder URL) to sync a folder that is not reachable by path under My Drive, such as a Google Drive for Desktop **Computers** folder. The path setting still works when the ID is empty.
+> - **Stops instead of trashing your vault** when the target folder is gone (ID in the trash or not a folder, or the configured path disappeared after a previous sync).
+> - **Deletion safety limit** (default 50): a sync that would delete more files stops before deleting anything. Run **"Sync now, allowing deletions"** to go ahead once.
+> - **Re-checks each Drive file right before overwriting or trashing it**, so an edit made during the sync (another device, an AI agent) is left for the next sync instead of being lost.
+> - Separate plugin ID `gsync-folder-id` and sign-in link `obsidian://gsync-folder-id-auth`, so it can't be replaced by an update of the original plugin. The default redirect page is this fork's GitHub Pages copy of `docs/callback.html`.
+>
+> Install with [BRAT](https://github.com/TfTHacker/obsidian42-brat): add `CthulhuMythos/ObsidianGSync`. Tests: `npm test`.
+
 
 Two-way sync between an Obsidian vault and a folder in Google Drive, using the Google Drive API directly.
 
@@ -50,7 +61,7 @@ GSync makes deliberate trade-offs:
 - **Network use.** GSync connects to:
   - `accounts.google.com` and `oauth2.googleapis.com`: Google sign-in and refreshing access tokens.
   - `www.googleapis.com`: the Google Drive API, to list, download, upload, and trash files in the folder you choose.
-  - `dg0988.github.io` (only during sign-in, and only if you keep the default redirect page): a static page in this repository ([`docs/callback.html`](docs/callback.html)) that hands Google's one-time sign-in code back to Obsidian through an `obsidian://` link. It has no server-side code and stores nothing. You can host your own copy instead.
+  - `cthulhumythos.github.io` (only during sign-in, and only if you keep the default redirect page): a static page in this repository ([`docs/callback.html`](docs/callback.html)) that hands Google's one-time sign-in code back to Obsidian through an `obsidian://` link. It has no server-side code and stores nothing. You can host your own copy instead.
 - **Vault access.** To compare your vault with Drive, GSync lists every file in the vault (except excluded files, hidden files, and the vault's config folder) and reads or writes only the files it syncs.
 - **Clipboard.** GSync only *writes* to the clipboard, and only when you ask: the **Copy refresh token** button, or copying the sign-in link if your browser can't be opened. It never reads the clipboard.
 - No telemetry, analytics, or ads. Nothing is sent anywhere except Google.
@@ -85,7 +96,7 @@ Also disable any other sync plugin that points at the same folder.
    - Application type: **Web application**
    - Authorized redirect URIs: add
      ```
-     https://dg0988.github.io/ObsidianGSync/callback.html
+     https://cthulhumythos.github.io/ObsidianGSync/callback.html
      ```
    Copy the **Client ID** and **Client secret**.
 
@@ -104,14 +115,14 @@ Updates arrive through Obsidian's built-in plugin updates.
 
 ### With BRAT (beta versions)
 
-Only needed if you want to test unreleased versions. Install **BRAT** from Community plugins, then **Add beta plugin** → `dg0988/ObsidianGSync`.
+Only needed if you want to test unreleased versions. Install **BRAT** from Community plugins, then **Add beta plugin** → `CthulhuMythos/ObsidianGSync` (this fork; the original is `dg0988/ObsidianGSync`).
 
 ### Manual
 
-Download `main.js` and `manifest.json` from the [latest release](https://github.com/dg0988/ObsidianGSync/releases/latest) into:
+Download `main.js` and `manifest.json` from the [latest release](https://github.com/CthulhuMythos/ObsidianGSync/releases/latest) into:
 
 ```
-<your vault>/.obsidian/plugins/gsync/
+<your vault>/.obsidian/plugins/gsync-folder-id/
 ```
 
 Then fully restart Obsidian and enable **GSync** under Community plugins. (On iPad/iPhone the Files app hides `.obsidian`; use BRAT, or an app like a-Shell to create the folder.)
@@ -155,7 +166,7 @@ Start a sync with any of:
 |---|---|---|
 | OAuth client ID / secret | — | From your Google Cloud **Web application** OAuth client. |
 | Refresh token (manual) | — | Filled in by signing in; or paste one from another device. |
-| Sign-in redirect page | `https://dg0988.github.io/ObsidianGSync/callback.html` | Must exactly match an authorized redirect URI on your OAuth client. |
+| Sign-in redirect page | `https://cthulhumythos.github.io/ObsidianGSync/callback.html` | Must exactly match an authorized redirect URI on your OAuth client. |
 | Google Drive folder | `Obsidian/<vault name>` | Path under *My Drive*. Backslashes are converted to `/`. |
 | Auto-sync every (minutes) | `10` | `0` disables auto-sync. Only runs while Obsidian is open. |
 | Sync when Obsidian starts | On | Skipped automatically if the previous sync didn't finish. |
@@ -248,7 +259,7 @@ Releases are built and signed by GitHub Actions ([`.github/workflows/release.yml
 To verify a downloaded `main.js`:
 
 ```
-gh attestation verify main.js --repo dg0988/ObsidianGSync
+gh attestation verify main.js --repo CthulhuMythos/ObsidianGSync
 ```
 
 ---

@@ -48,7 +48,7 @@ export default class GSyncPlugin extends Plugin {
       callback: () => void this.sync(false, true),
     });
 
-    // Google -> callback.html -> obsidian://gsync-auth?code=...&state=...
+    // Google -> callback.html -> obsidian://gsync-folder-id-auth?code=...&state=...
     this.registerObsidianProtocolHandler(PROTOCOL_ACTION, (params) => {
       void this.finishSignIn(params);
     });
