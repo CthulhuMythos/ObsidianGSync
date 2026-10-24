@@ -18,6 +18,7 @@ export interface GSyncSettings {
   maxFileSizeMB: number;
   maxDeletesPerSync: number;
   confirmDriveDeletesMinutes: number;
+  fullRescanHours: number;
 }
 
 export const DEFAULT_SETTINGS: GSyncSettings = {
@@ -34,6 +35,7 @@ export const DEFAULT_SETTINGS: GSyncSettings = {
   maxFileSizeMB: 25,
   maxDeletesPerSync: 50,
   confirmDriveDeletesMinutes: 5,
+  fullRescanHours: 24,
 };
 
 /** Accepts a bare folder ID or a Drive folder URL (…/folders/<id>?…) and returns the ID. */
@@ -225,6 +227,16 @@ export class GSyncSettingTab extends PluginSettingTab {
       .addText((t) =>
         t.setValue(String(s.confirmDriveDeletesMinutes)).onChange(async (v) => {
           s.confirmDriveDeletesMinutes = Math.max(0, parseInt(v, 10) || 0);
+          await this.plugin.saveAll();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Full rescan every (hours)")
+      .setDesc('Between full rescans a sync reads only what changed in Drive since the last sync, which takes seconds instead of listing every folder. Folder renames, moves and new folders trigger a full rescan automatically; "Sync now (full rescan)" forces one. 0 = always list every folder.')
+      .addText((t) =>
+        t.setValue(String(s.fullRescanHours)).onChange(async (v) => {
+          s.fullRescanHours = Math.max(0, parseInt(v, 10) || 0);
           await this.plugin.saveAll();
         })
       );

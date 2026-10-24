@@ -13,12 +13,35 @@ export interface RemoteFile {
   modifiedTime: string;
   size?: string;
   trashed?: boolean;
+  parents?: string[];
+}
+
+/** One entry of the Drive changes feed. */
+export interface DriveChange {
+  fileId: string;
+  removed?: boolean;
+  file?: RemoteFile;
 }
 
 export interface RemoteTree {
   files: Map<string, RemoteFile>; // vault-relative path -> file
   folders: Map<string, string>; // vault-relative folder path -> folder id ("" = root)
   warnings: string[];
+}
+
+export interface ListTreeOptions {
+  /** Folders listed at the same time (default 8). */
+  concurrency?: number;
+  /** Return true for a vault-relative folder path that should not be listed at all. */
+  skipFolder?: (path: string) => boolean;
+  /** Folders listed so far / folders known so far. */
+  onProgress?: (done: number, total: number) => void;
+}
+
+interface ChangeList {
+  changes: DriveChange[];
+  nextPageToken?: string;
+  newStartPageToken?: string;
 }
 
 interface FileList {
@@ -118,35 +141,97 @@ export class DriveClient {
     return { id: parent, created };
   }
 
+  /** Token marking "now" in the changes feed; take it before a full listing. */
+  async getStartPageToken(): Promise<string> {
+    const r = await this.req(`${API}/changes/startPageToken`);
+    return (r.json as { startPageToken: string }).startPageToken;
+  }
+
+  /** Every change since `token`, and the token to use next time. */
+  async listChanges(token: string): Promise<{ changes: DriveChange[]; newToken: string }> {
+    const changes: DriveChange[] = [];
+    let page = token;
+    for (;;) {
+      const params = new URLSearchParams({
+        pageToken: page,
+        pageSize: "1000",
+        spaces: "drive",
+        includeRemoved: "true",
+        fields: `nextPageToken,newStartPageToken,changes(fileId,removed,file(${FIELDS},trashed,parents))`,
+      });
+      const r = await this.req(`${API}/changes?${params.toString()}`);
+      const body = r.json as ChangeList;
+      changes.push(...body.changes);
+      if (body.nextPageToken) page = body.nextPageToken;
+      else if (body.newStartPageToken) return { changes, newToken: body.newStartPageToken };
+      else throw new Error("Drive changes feed returned no next token.");
+    }
+  }
+
   /** Current metadata of one file or folder, including whether it is in the trash. */
   async getFile(id: string): Promise<RemoteFile> {
-    const r = await this.req(`${API}/files/${encodeURIComponent(id)}?fields=${FIELDS},trashed`);
+    const r = await this.req(`${API}/files/${encodeURIComponent(id)}?fields=${FIELDS},trashed,parents`);
     return r.json as RemoteFile;
   }
 
-  async listTree(rootId: string): Promise<RemoteTree> {
+  /**
+   * List every file under rootId. Folders are listed `concurrency` at a time.
+   * `skipFolder(path)` prunes folders that are never synced (hidden, excluded).
+   * Any listing error rejects the whole call: a partial tree would look like
+   * deletions to the sync.
+   */
+  async listTree(rootId: string, opts: ListTreeOptions = {}): Promise<RemoteTree> {
+    const concurrency = Math.max(1, opts.concurrency ?? 8);
     const files = new Map<string, RemoteFile>();
     const folders = new Map<string, string>([["", rootId]]);
     const warnings: string[] = [];
     const queue: [string, string][] = [["", rootId]];
-    while (queue.length) {
-      const [prefix, id] = queue.shift() as [string, string];
-      for (const f of await this.listChildren(id)) {
-        const path = prefix ? `${prefix}/${f.name}` : f.name;
-        if (f.mimeType === FOLDER_MIME) {
-          if (!folders.has(path)) {
-            folders.set(path, f.id);
-            queue.push([path, f.id]);
-          }
-        } else if (f.mimeType.startsWith("application/vnd.google-apps.")) {
-          continue; // Google Docs/Sheets etc. can't be downloaded as files
-        } else if (files.has(path)) {
-          warnings.push(`Duplicate name in Drive, ignoring extra copy: ${path}`);
-        } else {
-          files.set(path, f);
+    let active = 0;
+    let done = 0;
+    let failed: unknown = null;
+
+    await new Promise<void>((resolve, reject) => {
+      const pump = () => {
+        if (failed) return;
+        if (!queue.length && active === 0) return resolve();
+        while (active < concurrency && queue.length) {
+          const [prefix, id] = queue.shift() as [string, string];
+          active++;
+          this.listChildren(id).then(
+            (children) => {
+              active--;
+              if (failed) return;
+              for (const f of children) {
+                const path = prefix ? `${prefix}/${f.name}` : f.name;
+                if (f.mimeType === FOLDER_MIME) {
+                  if (!folders.has(path) && !opts.skipFolder?.(path)) {
+                    folders.set(path, f.id);
+                    queue.push([path, f.id]);
+                  }
+                } else if (f.mimeType.startsWith("application/vnd.google-apps.")) {
+                  continue; // Google Docs/Sheets etc. can't be downloaded as files
+                } else if (files.has(path)) {
+                  warnings.push(`Duplicate name in Drive, ignoring extra copy: ${path}`);
+                } else {
+                  files.set(path, f);
+                }
+              }
+              done++;
+              opts.onProgress?.(done, done + active + queue.length);
+              pump();
+            },
+            (e) => {
+              active--;
+              if (!failed) {
+                failed = e;
+                reject(e instanceof Error ? e : new Error(String(e)));
+              }
+            }
+          );
         }
-      }
-    }
+      };
+      pump();
+    });
     return { files, folders, warnings };
   }
 
