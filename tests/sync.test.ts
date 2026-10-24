@@ -206,9 +206,11 @@ function setup(over: Partial<GSyncSettings> = {}) {
   const drive = new FakeDrive();
   const state: SyncState = {};
   const settings: GSyncSettings = { ...DEFAULT_SETTINGS, remoteFolder: "Obsidian/Test", ...over };
+  const clock = { now: 1_000_000 };
+  const minutes = (m: number) => (clock.now += m * 60 * 1000);
   const sync = (opts: SyncOptions = {}) =>
-    runSync(vault.app() as never, drive as unknown as DriveClient, settings, state, { checkpoint: async () => {}, progress: () => {} }, opts);
-  return { vault, drive, state, settings, sync };
+    runSync(vault.app() as never, drive as unknown as DriveClient, settings, state, { checkpoint: async () => {}, progress: () => {} }, { now: clock.now, ...opts });
+  return { vault, drive, state, settings, sync, minutes };
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -283,12 +285,82 @@ test("deletion limit: a mass delete in Drive pauses before deleting anything", a
   assert.equal(t.vault.files.size, 60);
 
   for (const c of t.drive.children(id)) c.trashed = true;
+  const first = await t.sync(); // first sighting: only marked as pending
+  assert.equal(first.pendingDeletes.length, 60);
+  t.minutes(6);
   await assert.rejects(t.sync(), (e) => e instanceof MassDeleteError && e.count === 60 && e.limit === 50);
   assert.equal(t.vault.files.size, 60);
 
   const r = await t.sync({ allowMassDelete: true });
   assert.equal(r.deletedLocal, 60);
   assert.equal(t.vault.files.size, 0);
+});
+
+test("confirmed deletes: a file gone from Drive is removed only on a sync after the delay", async () => {
+  const t = setup({ confirmDriveDeletesMinutes: 5 });
+  const id = t.drive.mkdirp("Obsidian/Test");
+  const fid = t.drive.putFile(id, "a.md", "A");
+  t.drive.putFile(id, "b.md", "B");
+  await t.sync();
+
+  t.drive.nodes.get(fid)!.trashed = true;
+  const r1 = await t.sync();
+  assert.deepEqual(r1.pendingDeletes, ["a.md"]);
+  assert.equal(r1.deletedLocal, 0);
+  assert.equal(t.vault.read("a.md"), "A");
+
+  t.minutes(2);
+  const r2 = await t.sync(); // still too soon
+  assert.deepEqual(r2.pendingDeletes, ["a.md"]);
+  assert.equal(t.vault.read("a.md"), "A");
+
+  t.minutes(4);
+  const r3 = await t.sync();
+  assert.equal(r3.deletedLocal, 1);
+  assert.equal(t.vault.read("a.md"), undefined);
+  assert.equal(t.vault.read("b.md"), "B");
+});
+
+test("confirmed deletes: a file that comes back (e.g. folder restore still in progress) is kept", async () => {
+  const t = setup({ confirmDriveDeletesMinutes: 5 });
+  const id = t.drive.mkdirp("Obsidian/Test");
+  const fid = t.drive.putFile(id, "sub/a.md", "A");
+  await t.sync();
+
+  t.drive.nodes.get(fid)!.trashed = true; // briefly hidden
+  assert.deepEqual((await t.sync()).pendingDeletes, ["sub/a.md"]);
+  t.drive.nodes.get(fid)!.trashed = false; // shows up again
+  t.minutes(10);
+  const r = await t.sync();
+  assert.deepEqual(r.pendingDeletes, []);
+  assert.equal(r.deletedLocal, 0);
+  assert.equal(t.vault.read("sub/a.md"), "A");
+  assert.equal(t.state["sub/a.md"].missingSince, undefined);
+
+  // Disappearing again later starts a fresh wait instead of reusing the old timestamp.
+  t.drive.nodes.get(fid)!.trashed = true;
+  t.minutes(30);
+  assert.deepEqual((await t.sync()).pendingDeletes, ["sub/a.md"]);
+  assert.equal(t.vault.read("sub/a.md"), "A");
+});
+
+test("confirmed deletes: 0 minutes removes on the first sync, local deletions are never delayed", async () => {
+  const t = setup({ confirmDriveDeletesMinutes: 0 });
+  const id = t.drive.mkdirp("Obsidian/Test");
+  const fid = t.drive.putFile(id, "a.md", "A");
+  t.drive.putFile(id, "b.md", "B");
+  await t.sync();
+  t.drive.nodes.get(fid)!.trashed = true;
+  assert.equal((await t.sync()).deletedLocal, 1);
+
+  const t2 = setup({ confirmDriveDeletesMinutes: 5 });
+  const id2 = t2.drive.mkdirp("Obsidian/Test");
+  t2.drive.putFile(id2, "c.md", "C");
+  await t2.sync();
+  t2.vault.files.delete("c.md");
+  const r = await t2.sync();
+  assert.equal(r.deletedRemote, 1);
+  assert.equal(t2.drive.readFile(id2, "c.md"), undefined);
 });
 
 test("deletion limit: deletions under the limit go through", async () => {

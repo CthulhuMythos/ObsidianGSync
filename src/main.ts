@@ -209,6 +209,12 @@ export default class GSyncPlugin extends Plugin {
         console.error("[gsync] errors", r.errors);
         new Notice(`${r.errors.length} file(s) failed to sync. First: ${r.errors[0]}`, 15000);
       }
+      if (r.pendingDeletes.length && !quiet) {
+        new Notice(
+          `${r.pendingDeletes.length} file(s) are gone from Drive. They stay here until a sync at least ${s.confirmDriveDeletesMinutes} min later confirms they are still gone:\n${r.pendingDeletes.slice(0, 5).join("\n")}`,
+          15000
+        );
+      }
       if (r.deferred.length) {
         new Notice(`Changed in Drive during this sync, left for the next one:\n${r.deferred.slice(0, 5).join("\n")}`, 15000);
       }

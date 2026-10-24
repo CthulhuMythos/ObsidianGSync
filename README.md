@@ -5,6 +5,7 @@
 > - **Folder ID**: set "Google Drive folder ID" (or paste the folder URL) to sync a folder that is not reachable by path under My Drive, such as a Google Drive for Desktop **Computers** folder. The path setting still works when the ID is empty.
 > - **Stops instead of trashing your vault** when the target folder is gone (ID in the trash or not a folder, or the configured path disappeared after a previous sync).
 > - **Deletion safety limit** (default 50): a sync that would delete more files stops before deleting anything. Run **"Sync now, allowing deletions"** to go ahead once.
+> - **Confirms deletions from Drive** (default 5 minutes): a file that disappears from Drive is removed locally only if it is still missing on a later sync at least that long after it was first seen missing. Drive can briefly hide files, e.g. while a folder is being restored from the trash, and that must not delete local notes.
 > - **Re-checks each Drive file right before overwriting or trashing it**, so an edit made during the sync (another device, an AI agent) is left for the next sync instead of being lost.
 > - Separate plugin ID `gsync-folder-id` and sign-in link `obsidian://gsync-folder-id-auth`, so it can't be replaced by an update of the original plugin. The default redirect page is this fork's GitHub Pages copy of `docs/callback.html`.
 >

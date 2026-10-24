@@ -1,7 +1,7 @@
 {
   "id": "gsync-folder-id",
   "name": "GSync (folder ID)",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "minAppVersion": "1.6.6",
   "description": "Fork of GSync: two-way sync between your vault and a Google Drive folder chosen by path or folder ID (including Computers folders), with deletion and overwrite safety checks. Works on desktop and mobile.",
   "author": "dg0988, fork by CthulhuMythos",
