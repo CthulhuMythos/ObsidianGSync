@@ -56,7 +56,7 @@
   if (code) parts.push("code=" + encodeURIComponent(code));
   if (state) parts.push("state=" + encodeURIComponent(state));
   if (error) parts.push("error=" + encodeURIComponent(error));
-  var url = "obsidian://gsync-auth?" + parts.join("&");
+  var url = "obsidian://gsync-folder-id-auth?" + parts.join("&");
 
   btn.href = url;
   if (error) {

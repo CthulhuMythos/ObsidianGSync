@@ -1,11 +1,11 @@
 {
-  "id": "gsync",
-  "name": "GSync",
-  "version": "1.0.4",
+  "id": "gsync-folder-id",
+  "name": "GSync (folder ID)",
+  "version": "1.0.5",
   "minAppVersion": "1.6.6",
-  "description": "Two-way sync between your vault and a Google Drive folder using the Google Drive API. Works on desktop and mobile.",
-  "author": "dg0988",
-  "authorUrl": "https://github.com/dg0988",
+  "description": "Fork of GSync: two-way sync between your vault and a Google Drive folder chosen by path or folder ID (including Computers folders), with deletion and overwrite safety checks. Works on desktop and mobile.",
+  "author": "dg0988, fork by CthulhuMythos",
+  "authorUrl": "https://github.com/CthulhuMythos/ObsidianGSync",
   "isDesktopOnly": false,
   "fundingUrl": "https://www.paypal.com/donate/?hosted_button_id=N8NVQRB353E2G"
 }

@@ -5,8 +5,8 @@ const TOKEN_URL = "https://oauth2.googleapis.com/token";
 // Full Drive scope so the plugin can see files that already exist in the
 // chosen folder (drive.file would only see files this plugin created).
 export const SCOPE = "https://www.googleapis.com/auth/drive";
-export const DEFAULT_REDIRECT = "https://dg0988.github.io/ObsidianGSync/callback.html";
-export const PROTOCOL_ACTION = "gsync-auth";
+export const DEFAULT_REDIRECT = "https://cthulhumythos.github.io/ObsidianGSync/callback.html";
+export const PROTOCOL_ACTION = "gsync-folder-id-auth";
 const PENDING_TTL_MS = 15 * 60 * 1000;
 
 export interface TokenSet {

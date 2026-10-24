@@ -10,11 +10,13 @@ export interface GSyncSettings {
   refreshToken: string;
   redirectUri: string;
   remoteFolder: string;
+  remoteFolderId: string;
   autoSyncMinutes: number;
   syncOnStartup: boolean;
   propagateDeletes: boolean;
   excludes: string;
   maxFileSizeMB: number;
+  maxDeletesPerSync: number;
 }
 
 export const DEFAULT_SETTINGS: GSyncSettings = {
@@ -23,12 +25,21 @@ export const DEFAULT_SETTINGS: GSyncSettings = {
   refreshToken: "",
   redirectUri: DEFAULT_REDIRECT,
   remoteFolder: "",
+  remoteFolderId: "",
   autoSyncMinutes: 10,
   syncOnStartup: true,
   propagateDeletes: true,
   excludes: "# One rule per line. Hidden files/folders and the vault config folder are always skipped.\n# Examples:  Templates/   *.tmp   desktop.ini\ndesktop.ini\nThumbs.db\n",
   maxFileSizeMB: 25,
+  maxDeletesPerSync: 50,
 };
+
+/** Accepts a bare folder ID or a Drive folder URL (…/folders/<id>?…) and returns the ID. */
+export function parseFolderId(input: string): string {
+  const v = input.trim();
+  const m = v.match(/\/folders\/([A-Za-z0-9_-]+)/) ?? v.match(/[?&]id=([A-Za-z0-9_-]+)/);
+  return m ? m[1] : v;
+}
 
 export class GSyncSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: GSyncPlugin) {
@@ -156,6 +167,18 @@ export class GSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Google Drive folder ID")
+      .setDesc("Optional. Overrides the path above and also works for folders outside My Drive (e.g. Computers). Paste the folder URL or the ID after /folders/.")
+      .addText((t) =>
+        t.setValue(s.remoteFolderId).onChange(async (v) => {
+          const next = parseFolderId(v);
+          if (next !== s.remoteFolderId) this.plugin.state = {}; // new target -> fresh comparison
+          s.remoteFolderId = next;
+          await this.plugin.saveAll();
+        })
+      );
+
+    new Setting(containerEl)
       .setName("Auto-sync every (minutes)")
       .setDesc("0 turns auto-sync off.")
       .addText((t) =>
@@ -180,6 +203,16 @@ export class GSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.propagateDeletes).onChange(async (v) => {
           s.propagateDeletes = v;
+          await this.plugin.saveAll();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Deletion safety limit")
+      .setDesc('A sync that would delete more files than this (on either side) stops before deleting anything. Run "Sync now, allowing deletions" to go ahead. 0 = no limit.')
+      .addText((t) =>
+        t.setValue(String(s.maxDeletesPerSync)).onChange(async (v) => {
+          s.maxDeletesPerSync = Math.max(0, parseInt(v, 10) || 0);
           await this.plugin.saveAll();
         })
       );
