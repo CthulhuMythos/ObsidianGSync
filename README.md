@@ -7,6 +7,7 @@
 > - **Deletion safety limit** (default 50): a sync that would delete more files stops before deleting anything. Run **"Sync now, allowing deletions"** to go ahead once.
 > - **Confirms deletions from Drive** (default 5 minutes): a file that disappears from Drive is removed locally only if it is still missing on a later sync at least that long after it was first seen missing. Drive can briefly hide files, e.g. while a folder is being restored from the trash, and that must not delete local notes.
 > - **Re-checks each Drive file right before overwriting or trashing it**, so an edit made during the sync (another device, an AI agent) is left for the next sync instead of being lost.
+> - **Faster on large vaults**: Drive folders are listed 8 at a time and files transferred 4 at a time; hidden and excluded folders (e.g. `.obsidian`) are not listed at all; a manual sync shows "reading Drive folders x/y" while it lists. Any listing error stops the sync rather than working from a partial tree.
 > - Separate plugin ID `gsync-folder-id` and sign-in link `obsidian://gsync-folder-id-auth`, so it can't be replaced by an update of the original plugin. The default redirect page is this fork's GitHub Pages copy of `docs/callback.html`.
 >
 > Install with [BRAT](https://github.com/TfTHacker/obsidian42-brat): add `CthulhuMythos/ObsidianGSync`. Tests: `npm test`.

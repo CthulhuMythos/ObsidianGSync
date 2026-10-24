@@ -46,7 +46,12 @@ export interface SyncHooks {
   /** Persist state mid-sync so a crash doesn't lose finished work. */
   checkpoint: () => Promise<void>;
   progress: (done: number, total: number, transferred: number) => void;
+  /** Drive folders listed so far / known so far, while reading the remote tree. */
+  listing?: (done: number, total: number) => void;
 }
+
+/** Files handled at the same time in the main pass. */
+const TRANSFER_CONCURRENCY = 4;
 
 const rev = (f: RemoteFile) => f.md5Checksum ?? f.modifiedTime;
 
@@ -129,7 +134,11 @@ export async function runSync(
   const configDir = vault.configDir;
 
   const rootId = await resolveRoot(drive, settings, state);
-  const tree: RemoteTree = await drive.listTree(rootId);
+  const tree: RemoteTree = await drive.listTree(rootId, {
+    // A folder whose contents are all excluded (hidden, config dir, "Folder/" rules) is never listed.
+    skipFolder: (p) => isExcluded(p + "/", rules, configDir),
+    onProgress: hooks.listing,
+  });
   res.warnings.push(...tree.warnings);
 
   const local = new Map<string, TFile>();
@@ -167,6 +176,8 @@ export async function runSync(
     state[path] = { remoteId: r.id, remoteRev: rev(r), localMtime: st.mtime, localSize: st.size };
   };
 
+  // Files are handled concurrently, so a new folder is created once and shared.
+  const creatingRemote = new Map<string, Promise<string>>();
   const ensureRemoteParent = async (path: string): Promise<string> => {
     const parts = path.split("/").slice(0, -1);
     let cur = "";
@@ -175,8 +186,16 @@ export async function runSync(
       cur = cur ? `${cur}/${p}` : p;
       let id = tree.folders.get(cur);
       if (!id) {
-        id = await drive.createFolder(p, parentId);
-        tree.folders.set(cur, id);
+        const key = cur;
+        let pending = creatingRemote.get(key);
+        if (!pending) {
+          pending = drive.createFolder(p, parentId).then((newId) => {
+            tree.folders.set(key, newId);
+            return newId;
+          });
+          creatingRemote.set(key, pending);
+        }
+        id = await pending;
       }
       parentId = id;
     }
@@ -188,7 +207,12 @@ export async function runSync(
     let cur = "";
     for (const p of parts) {
       cur = cur ? `${cur}/${p}` : p;
-      if (!vault.getAbstractFileByPath(cur)) await vault.createFolder(cur);
+      if (vault.getAbstractFileByPath(cur)) continue;
+      try {
+        await vault.createFolder(cur);
+      } catch (e) {
+        if (!vault.getAbstractFileByPath(cur)) throw e; // another file in this sync created it first
+      }
     }
   };
 
@@ -238,24 +262,17 @@ export async function runSync(
   const work = () => res.uploaded + res.downloaded + res.deletedLocal + res.deletedRemote + res.conflicts.length;
   let lastCheckpointWork = 0;
   let lastCheckpointAt = Date.now();
+  let checkpointing: Promise<void> | null = null;
   let done = 0;
 
-  for (const path of paths) {
-    done++;
-    if (done % 10 === 0) hooks.progress(done, paths.length, work());
-    // Save progress every 10 transfers or 5 seconds.
-    if (work() - lastCheckpointWork >= 10 || (work() > lastCheckpointWork && Date.now() - lastCheckpointAt > 5000)) {
-      await hooks.checkpoint();
-      lastCheckpointWork = work();
-      lastCheckpointAt = Date.now();
-    }
-    if (isExcluded(path, rules, configDir)) continue;
+  const syncPath = async (path: string) => {
+    if (isExcluded(path, rules, configDir)) return;
     try {
       const l = local.get(path);
       const r = remote.get(path);
       if (tooBig(l, r)) {
         res.skipped.push(path);
-        continue;
+        return;
       }
       const s = state[path];
       if (s && r && s.missingSince !== undefined) delete s.missingSince; // back in Drive: forget the pending delete
@@ -263,13 +280,13 @@ export async function runSync(
       if (l && r) {
         if (!s) {
           await resolveBothChanged(path, l, r); // first time we've seen both: compare contents
-          continue;
+          return;
         }
         const lChanged = localChangedSince(l, s);
         const rChanged = rev(r) !== s.remoteRev || r.id !== s.remoteId;
         if (lChanged && rChanged) await resolveBothChanged(path, l, r);
         else if (lChanged) {
-          if (!(await unchangedInDrive(path, r))) continue;
+          if (!(await unchangedInDrive(path, r))) return;
           const updated = await drive.updateFile(r.id, await vault.readBinary(l));
           await record(path, updated);
           res.uploaded++;
@@ -283,7 +300,7 @@ export async function runSync(
           if (!driveDeleteConfirmed(s)) {
             s.missingSince ??= now;
             res.pendingDeletes.push(path);
-            continue;
+            return;
           }
           await app.fileManager.trashFile(l); // deleted in Drive (confirmed) -> delete here
           delete state[path];
@@ -295,7 +312,7 @@ export async function runSync(
         }
       } else if (!l && r) {
         if (s && settings.propagateDeletes && rev(r) === s.remoteRev) {
-          if (!(await unchangedInDrive(path, r))) continue;
+          if (!(await unchangedInDrive(path, r))) return;
           await drive.trash(r.id); // deleted here -> move to Drive trash
           delete state[path];
           res.deletedRemote++;
@@ -310,7 +327,29 @@ export async function runSync(
     } catch (e) {
       res.errors.push(`${path}: ${(e as Error).message}`);
     }
-  }
+  };
+
+  const afterEach = async () => {
+    done++;
+    if (done % 10 === 0) hooks.progress(done, paths.length, work());
+    // Save progress every 10 transfers or 5 seconds (one save at a time).
+    if (!checkpointing && (work() - lastCheckpointWork >= 10 || (work() > lastCheckpointWork && Date.now() - lastCheckpointAt > 5000))) {
+      lastCheckpointWork = work();
+      lastCheckpointAt = Date.now();
+      checkpointing = hooks.checkpoint().finally(() => (checkpointing = null));
+      await checkpointing;
+    }
+  };
+
+  let next = 0;
+  const worker = async () => {
+    while (next < paths.length) {
+      const path = paths[next++];
+      await syncPath(path);
+      await afterEach();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(TRANSFER_CONCURRENCY, paths.length) }, worker));
   hooks.progress(paths.length, paths.length, work());
   return res;
 }

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { TFile, TFolder } from "obsidian";
-import type { DriveClient, RemoteFile, RemoteTree } from "../src/drive";
+import { DriveClient, ListTreeOptions, RemoteFile, RemoteTree } from "../src/drive";
 import { DEFAULT_SETTINGS, GSyncSettings, parseFolderId } from "../src/settings";
 import { MassDeleteError, runSync, SyncOptions, SyncState } from "../src/sync";
 
@@ -13,6 +13,7 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 const buf = (s: string) => enc.encode(s).buffer as ArrayBuffer;
 const text = (b: ArrayBuffer) => dec.decode(b);
+const tick = () => new Promise((r) => setTimeout(r, 1));
 const md5 = (b: ArrayBuffer) => createHash("md5").update(Buffer.from(b)).digest("hex");
 
 // ---- fake vault -------------------------------------------------------------
@@ -43,6 +44,9 @@ class FakeVault {
     return null;
   }
   async createFolder(path: string) {
+    await tick();
+    // Like Obsidian: creating an existing folder throws.
+    if (this.folders.has(path)) throw new Error("Folder already exists.");
     this.folders.add(path);
   }
   async readBinary(f: TFile) {
@@ -162,13 +166,14 @@ class FakeDrive {
     if (!n) throw new Error(`Drive API 404: ${id}`);
     return { ...this.meta(n), trashed: this.isTrashed(id) };
   }
-  async listTree(rootId: string): Promise<RemoteTree> {
+  async listTree(rootId: string, opts: ListTreeOptions = {}): Promise<RemoteTree> {
     const files = new Map<string, RemoteFile>();
     const folders = new Map<string, string>([["", rootId]]);
     const walk = (id: string, prefix: string) => {
       for (const c of this.children(id)) {
         const p = prefix ? `${prefix}/${c.name}` : c.name;
         if (c.mimeType === FOLDER) {
+          if (opts.skipFolder?.(p)) continue;
           folders.set(p, c.id);
           walk(c.id, p);
         } else files.set(p, this.meta(c));
@@ -180,7 +185,10 @@ class FakeDrive {
     hook?.();
     return { files, folders, warnings: [] };
   }
+  foldersCreated = 0;
   async createFolder(name: string, parent: string) {
+    await tick();
+    this.foldersCreated++;
     return this.add(name, parent, FOLDER);
   }
   async createFile(name: string, parent: string, data: ArrayBuffer) {
@@ -412,3 +420,91 @@ test("pre-write check: a file edited in Drive during the sync is not trashed", a
   assert.equal(r2.downloaded, 1);
   assert.equal(t.vault.read("a.md"), "agent edit");
 });
+
+// ---- DriveClient.listTree (the real implementation, listChildren faked) -----
+class ListingClient extends DriveClient {
+  active = 0;
+  maxActive = 0;
+  listed: string[] = [];
+  failOn = "";
+  constructor(private tree: Record<string, { name: string; folder?: boolean; id: string }[]>) {
+    super(async () => "token");
+  }
+  async listChildren(id: string): Promise<RemoteFile[]> {
+    this.active++;
+    this.maxActive = Math.max(this.maxActive, this.active);
+    this.listed.push(id);
+    await new Promise((r) => setTimeout(r, 2));
+    this.active--;
+    if (id === this.failOn) throw new Error("Drive API 500: boom");
+    return (this.tree[id] ?? []).map((c) => ({
+      id: c.id,
+      name: c.name,
+      mimeType: c.folder ? FOLDER : "text/markdown",
+      modifiedTime: "t",
+      md5Checksum: c.id,
+    }));
+  }
+}
+
+function bigTree() {
+  const tree: Record<string, { name: string; folder?: boolean; id: string }[]> = { root: [] };
+  for (let i = 0; i < 20; i++) {
+    tree.root.push({ name: `d${i}`, folder: true, id: `d${i}` });
+    tree[`d${i}`] = [
+      { name: `n.md`, id: `d${i}/n` },
+      { name: `sub`, folder: true, id: `d${i}/sub` },
+    ];
+    tree[`d${i}/sub`] = [{ name: `m.md`, id: `d${i}/sub/m` }];
+  }
+  tree.root.push({ name: ".obsidian", folder: true, id: "cfg" });
+  tree.cfg = [{ name: "app.json", id: "cfg/app" }];
+  return tree;
+}
+
+test("listTree: lists folders concurrently, up to the limit, with the same result", async () => {
+  const c = new ListingClient(bigTree());
+  const progress: [number, number][] = [];
+  const t = await c.listTree("root", { concurrency: 8, onProgress: (d, n) => progress.push([d, n]) });
+  assert.equal(t.files.size, 41); // 20 n.md + 20 m.md + app.json
+  assert.equal(t.files.get("d3/sub/m.md")?.id, "d3/sub/m");
+  assert.ok(c.maxActive > 1 && c.maxActive <= 8, `maxActive ${c.maxActive}`);
+  const last = progress[progress.length - 1];
+  assert.equal(last[0], last[1]);
+  assert.equal(last[0], 42); // root + 20 + 20 + .obsidian
+});
+
+test("listTree: skipped folders are never listed", async () => {
+  const c = new ListingClient(bigTree());
+  const t = await c.listTree("root", { skipFolder: (p) => p.split("/").some((s) => s.startsWith(".")) || p === "d0" });
+  assert.ok(!c.listed.includes("cfg"));
+  assert.ok(!c.listed.includes("d0") && !c.listed.includes("d0/sub"));
+  assert.ok(!t.files.has(".obsidian/app.json"));
+  assert.ok(!t.files.has("d0/n.md"));
+  assert.equal(t.files.size, 38);
+});
+
+test("listTree: one failed folder fails the whole listing (no partial tree)", async () => {
+  const c = new ListingClient(bigTree());
+  c.failOn = "d7/sub";
+  await assert.rejects(c.listTree("root", { concurrency: 8 }), /boom/);
+});
+
+test("concurrent transfers: many new files in one new folder create it once, both directions", async () => {
+  const t = setup();
+  const id = t.drive.mkdirp("Obsidian/Test");
+  await t.sync();
+  for (let i = 0; i < 12; i++) t.vault.put(`new/deep/f${i}.md`, `F${i}`);
+  const r = await t.sync();
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.uploaded, 12);
+  assert.equal(t.drive.foldersCreated, 2, "one 'new' and one 'deep' folder");
+  assert.equal(t.drive.readFile(id, "new/deep/f7.md"), "F7");
+
+  for (let i = 0; i < 12; i++) t.drive.putFile(id, `down/a/b/g${i}.md`, `G${i}`);
+  const r2 = await t.sync();
+  assert.deepEqual(r2.errors, []);
+  assert.equal(r2.downloaded, 12);
+  assert.equal(t.vault.read("down/a/b/g11.md"), "G11");
+});
+

@@ -190,6 +190,15 @@ export default class GSyncPlugin extends Plugin {
             else progressNotice.setMessage(msg);
           }
         },
+        listing: (done, total) => {
+          const msg = `GSync: reading Drive folders ${done}/${total}`;
+          this.setStatus(msg);
+          // A manual first sync of a large vault spends minutes here; show it on mobile too.
+          if (Platform.isMobile && !quiet && done < total) {
+            if (!progressNotice) progressNotice = new Notice(msg, 0);
+            else progressNotice.setMessage(msg);
+          }
+        },
       }, { allowMassDelete });
       this.syncInProgress = false;
       await this.saveAll();
