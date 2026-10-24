@@ -8,6 +8,8 @@ export interface SyncRecord {
   remoteRev: string;
   localMtime: number;
   localSize: number;
+  /** When the file was first seen missing from Drive while still present here (ms since epoch). */
+  missingSince?: number;
 }
 export type SyncState = Record<string, SyncRecord>;
 
@@ -22,11 +24,15 @@ export interface SyncResult {
   skipped: string[];
   /** Changed in Drive while this sync ran; left untouched for the next sync. */
   deferred: string[];
+  /** Missing from Drive but kept here until the deletion has been confirmed by a later sync. */
+  pendingDeletes: string[];
 }
 
 export interface SyncOptions {
   /** Skip the deletion safety limit for this one run (the user confirmed). */
   allowMassDelete?: boolean;
+  /** Current time in ms; tests pass a fake clock. */
+  now?: number;
 }
 
 /** Thrown before anything is deleted when a sync would delete more than the safety limit. */
@@ -117,7 +123,7 @@ export async function runSync(
   opts: SyncOptions = {}
 ): Promise<SyncResult> {
   const vault = app.vault;
-  const res: SyncResult = { uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: [], errors: [], warnings: [], skipped: [], deferred: [] };
+  const res: SyncResult = { uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: [], errors: [], warnings: [], skipped: [], deferred: [], pendingDeletes: [] };
   const maxBytes = Math.max(0, settings.maxFileSizeMB) * 1024 * 1024;
   const rules = parseExcludes(settings.excludes);
   const configDir = vault.configDir;
@@ -130,6 +136,13 @@ export async function runSync(
   for (const f of vault.getFiles()) if (!isExcluded(f.path, rules, configDir)) local.set(f.path, f);
   const remote = tree.files;
 
+  // Drive can briefly hide files, e.g. while a folder is being restored from the
+  // trash. A file missing from Drive must stay missing across syncs for this long
+  // before the local copy is trashed.
+  const now = opts.now ?? Date.now();
+  const confirmMs = Math.max(0, settings.confirmDriveDeletesMinutes) * 60 * 1000;
+  const driveDeleteConfirmed = (s: SyncRecord) => confirmMs === 0 || (s.missingSince !== undefined && now - s.missingSince >= confirmMs);
+
   const tooBig = (l: TFile | undefined, r: RemoteFile | undefined) =>
     maxBytes > 0 && ((!!l && l.stat.size > maxBytes) || (!!r && Number(r.size ?? 0) > maxBytes));
 
@@ -141,7 +154,7 @@ export async function runSync(
       const l = local.get(path);
       const r = remote.get(path);
       if (tooBig(l, r)) continue;
-      if (l && !r && !localChangedSince(l, s)) planned++;
+      if (l && !r && !localChangedSince(l, s) && driveDeleteConfirmed(s)) planned++;
       else if (!l && r && rev(r) === s.remoteRev) planned++;
     }
     if (planned > settings.maxDeletesPerSync) throw new MassDeleteError(planned, settings.maxDeletesPerSync);
@@ -245,6 +258,7 @@ export async function runSync(
         continue;
       }
       const s = state[path];
+      if (s && r && s.missingSince !== undefined) delete s.missingSince; // back in Drive: forget the pending delete
 
       if (l && r) {
         if (!s) {
@@ -266,7 +280,12 @@ export async function runSync(
         }
       } else if (l && !r) {
         if (s && settings.propagateDeletes && !localChangedSince(l, s)) {
-          await app.fileManager.trashFile(l); // deleted in Drive -> delete here
+          if (!driveDeleteConfirmed(s)) {
+            s.missingSince ??= now;
+            res.pendingDeletes.push(path);
+            continue;
+          }
+          await app.fileManager.trashFile(l); // deleted in Drive (confirmed) -> delete here
           delete state[path];
           res.deletedLocal++;
         } else {

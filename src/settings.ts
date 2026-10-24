@@ -17,6 +17,7 @@ export interface GSyncSettings {
   excludes: string;
   maxFileSizeMB: number;
   maxDeletesPerSync: number;
+  confirmDriveDeletesMinutes: number;
 }
 
 export const DEFAULT_SETTINGS: GSyncSettings = {
@@ -32,6 +33,7 @@ export const DEFAULT_SETTINGS: GSyncSettings = {
   excludes: "# One rule per line. Hidden files/folders and the vault config folder are always skipped.\n# Examples:  Templates/   *.tmp   desktop.ini\ndesktop.ini\nThumbs.db\n",
   maxFileSizeMB: 25,
   maxDeletesPerSync: 50,
+  confirmDriveDeletesMinutes: 5,
 };
 
 /** Accepts a bare folder ID or a Drive folder URL (…/folders/<id>?…) and returns the ID. */
@@ -213,6 +215,16 @@ export class GSyncSettingTab extends PluginSettingTab {
       .addText((t) =>
         t.setValue(String(s.maxDeletesPerSync)).onChange(async (v) => {
           s.maxDeletesPerSync = Math.max(0, parseInt(v, 10) || 0);
+          await this.plugin.saveAll();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Confirm deletions from Drive after (minutes)")
+      .setDesc("A file that disappears from Drive is removed here only if it is still missing on a sync at least this many minutes later. Guards against Drive briefly hiding files, e.g. while a folder is restored from the trash. 0 = remove on the first sync.")
+      .addText((t) =>
+        t.setValue(String(s.confirmDriveDeletesMinutes)).onChange(async (v) => {
+          s.confirmDriveDeletesMinutes = Math.max(0, parseInt(v, 10) || 0);
           await this.plugin.saveAll();
         })
       );
